@@ -1,12 +1,7 @@
-# Ignore environment files
 .env
 *.env
-
-# Ignore virtual environments
-.venv/
-venv/
-env/
-
-# Ignore Python cache
 __pycache__/
-*.pyc
+.venv/
+.env.local
+.env.development
+.env.production
