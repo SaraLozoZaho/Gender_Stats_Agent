@@ -6,7 +6,6 @@ from tkinter import ttk
 import pandas as pd
 
 from agent.agent_core import run_gender_expert_agent
-# ❗ Import correcto (este es el pipeline real)
 from analysis.statistics_pipeline_gender import build_gender_stats_payload
 
 
