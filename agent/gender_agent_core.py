@@ -3,93 +3,109 @@
 import numpy as np
 import pandas as pd
 from scipy import stats
+import statsmodels.api as sm
 
 from utils.sex_gender_utils import detect_sex_gender_vars
 
 
-# ========================================================================
-# HELPER: select numeric columns
-# ========================================================================
+# ======================================================================
+# Helpers
+# ======================================================================
 
-def _numeric_columns(df):
+def _numeric_columns(df: pd.DataFrame):
     return df.select_dtypes(include=[np.number]).columns.tolist()
 
 
-# ========================================================================
-# 1. DESCRIPTIVES
-# ========================================================================
+def _has_variability(arr: np.ndarray):
+    arr = arr[~np.isnan(arr)]
+    return len(np.unique(arr)) >= 2
 
-def compute_descriptives(df, sex_gender_info):
+
+# ======================================================================
+# 1) DESCRIPTIVES
+# ======================================================================
+
+def compute_descriptives(df: pd.DataFrame, sex_gender_info):
     result = {
         "by_sex": {},
-        "by_gender": {}
+        "by_gender": {},
+        "overall": {}
     }
+
+    numeric_cols = _numeric_columns(df)
+    overall = {}
+    for var in numeric_cols:
+        x = df[var].dropna()
+        if len(x) == 0:
+            continue
+        overall[var] = {
+            "mean": float(np.mean(x)),
+            "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None,
+            "n": int(len(x)),
+        }
+    result["overall"] = overall
 
     # --- SEX ---
     if sex_gender_info.sex_col:
         col = sex_gender_info.sex_col
-        groups = df[col].dropna().unique()
-
-        for g in groups:
-            sub = df[df[col] == g]
+        for g, sub in df.groupby(col):
             desc = {}
-            for var in _numeric_columns(df):
+            for var in numeric_cols:
                 x = sub[var].dropna()
-                if len(x) > 0:
-                    desc[var] = {
-                        "mean": float(np.mean(x)),
-                        "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None
-                    }
+                if len(x) == 0:
+                    continue
+                desc[var] = {
+                    "mean": float(np.mean(x)),
+                    "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None,
+                    "n": int(len(x)),
+                }
             result["by_sex"][str(g)] = desc
 
-    # --- GENDER ---
+    # --- GENDER (por si algún día lo tienes) ---
     if sex_gender_info.gender_col:
         col = sex_gender_info.gender_col
-        groups = df[col].dropna().unique()
-
-        for g in groups:
-            sub = df[df[col] == g]
+        for g, sub in df.groupby(col):
             desc = {}
-            for var in _numeric_columns(df):
+            for var in numeric_cols:
                 x = sub[var].dropna()
-                if len(x) > 0:
-                    desc[var] = {
-                        "mean": float(np.mean(x)),
-                        "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None
-                    }
+                if len(x) == 0:
+                    continue
+                desc[var] = {
+                    "mean": float(np.mean(x)),
+                    "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None,
+                    "n": int(len(x)),
+                }
             result["by_gender"][str(g)] = desc
 
     return result
 
 
-# ========================================================================
-# 2. GROUP TESTS (t-test / Mann–Whitney)
-# ========================================================================
+# ======================================================================
+# 2) TESTS POR GRUPOS (SEX) – t-test / Mann–Whitney + efecto + CI
+# ======================================================================
 
-def compute_group_tests(df, sex_gender_info):
+def compute_group_tests(df: pd.DataFrame, sex_gender_info):
     result = {}
 
-    # Prefer SEX over GENDER if both exist
     group_col = sex_gender_info.sex_col or sex_gender_info.gender_col
     if not group_col:
-        return {}
+        return result
 
     groups = df[group_col].dropna().unique()
     if len(groups) != 2:
-        # tests only meaningful for 2 groups
-        return {}
+        return result
 
     g1, g2 = groups
     numeric_cols = _numeric_columns(df)
 
     for var in numeric_cols:
-        x = df[df[group_col] == g1][var].dropna()
-        y = df[df[group_col] == g2][var].dropna()
+        x = df[df[group_col] == g1][var].dropna().values
+        y = df[df[group_col] == g2][var].dropna().values
 
         if len(x) < 3 or len(y) < 3:
             continue
 
-        # Normality check
+        # Normalidad aproximada
         normal = False
         try:
             _, p1 = stats.shapiro(x)
@@ -99,15 +115,21 @@ def compute_group_tests(df, sex_gender_info):
             pass
 
         if normal:
-            test_name = "t-test"
+            test_name = "t-test (Welch)"
             t, p = stats.ttest_ind(x, y, equal_var=False)
-            effect = float(np.mean(x) - np.mean(y))
+            effect = float(np.mean(x) - np.mean(y))  # diferencia de medias
+            # Cohen's d aproximado
+            sp = np.sqrt(((len(x) - 1) * np.var(x, ddof=1) + (len(y) - 1) * np.var(y, ddof=1)) /
+                         (len(x) + len(y) - 2))
+            d = effect / sp if sp > 0 else None
         else:
             test_name = "Mann-Whitney U"
             u, p = stats.mannwhitneyu(x, y, alternative="two-sided")
             effect = float(np.median(x) - np.median(y))
+            d = None
 
-        # Confidence interval for effect (bootstrap 2000 samples)
+        # Bootstrap CI de la diferencia de medias
+        ci = None
         try:
             boot = []
             for _ in range(1500):
@@ -118,120 +140,272 @@ def compute_group_tests(df, sex_gender_info):
             ci_high = float(np.percentile(boot, 97.5))
             ci = [ci_low, ci_high]
         except Exception:
-            ci = None
+            pass
 
         result[var] = {
             "test_name": test_name,
             "p": float(p),
             "effect": effect,
-            "ci": ci
+            "ci": ci,
+            "cohens_d": float(d) if d is not None else None,
+            "group_labels": [str(g1), str(g2)],
+            "n1": int(len(x)),
+            "n2": int(len(y)),
         }
 
     return result
 
 
-# ========================================================================
-# 3. SIMPLE PREDICTIVE MODELS
-# ========================================================================
+# ======================================================================
+# 3) ÍNDICES DERIVADOS (VT indexado por peso)
+# ======================================================================
 
-def compute_models(df, sex_gender_info):
+def compute_derived_indices(df: pd.DataFrame):
     """
-    Very simple model:
-    - If binary outcome exists (column name contains 'outcome'), run logistic regression.
-    - Sex/Gender is included as main predictor.
+    Crea índices derivados, por ahora:
+    - VT_per_ideal_weight si existen columnas tipo VT y IdealWeight
+    - VT_per_weight (por kg real) si existen VT y Weight
+    Devuelve un dict resumen y NO modifica el df original.
     """
-    import statsmodels.api as sm
 
-    result = {}
+    derived = {}
 
-    # Find binary outcome
-    candidate_cols = [c for c in df.columns if "outcome" in c.lower()]
-    if not candidate_cols:
-        return result
+    # Intentar encontrar columnas razonables
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    outcome_col = candidate_cols[0]
-    y = df[outcome_col]
+    vt_col = None
+    for key in cols_lower:
+        if "vt" in key or "tidal" in key:
+            vt_col = cols_lower[key]
+            break
 
-    # Predictor is SEX or GENDER
-    pred = sex_gender_info.sex_col or sex_gender_info.gender_col
-    if not pred:
-        return result
+    ideal_col = None
+    for key in cols_lower:
+        if "ideal" in key and "weight" in key:
+            ideal_col = cols_lower[key]
+            break
 
-    # Encode categorical as 0/1
-    df2 = df[[pred, outcome_col]].dropna()
-    if df2[pred].nunique() != 2:
-        return result
+    weight_col = None
+    for key in cols_lower:
+        if key in ["weight", "bodyweight", "gewicht"]:
+            weight_col = cols_lower[key]
+            break
 
-    df2["pred_encoded"] = df2[pred].astype("category").cat.codes
-    X = sm.add_constant(df2["pred_encoded"])
-    y = df2[outcome_col]
+    # Crear índices en una copia
+    df_idx = df.copy()
 
-    try:
-        model = sm.Logit(y, X).fit(disp=False)
-        OR = float(np.exp(model.params["pred_encoded"]))
-        p = float(model.pvalues["pred_encoded"])
-        result["logistic_sexgender"] = {
-            "metric": f"Odds Ratio = {OR:.3f}, p={p:.3e}",
-            "sex_effect": OR,
-            "notes": None
-        }
-    except Exception:
-        pass
+    if vt_col and ideal_col:
+        df_idx["VT_per_ideal_weight"] = df_idx[vt_col] / df_idx[ideal_col]
+        x = df_idx["VT_per_ideal_weight"].dropna()
+        if len(x) > 0:
+            derived["VT_per_ideal_weight"] = {
+                "mean": float(np.mean(x)),
+                "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None,
+                "n": int(len(x)),
+            }
 
-    return result
+    if vt_col and weight_col:
+        df_idx["VT_per_weight"] = df_idx[vt_col] / df_idx[weight_col]
+        x = df_idx["VT_per_weight"].dropna()
+        if len(x) > 0:
+            derived["VT_per_weight"] = {
+                "mean": float(np.mean(x)),
+                "sd": float(np.std(x, ddof=1)) if len(x) > 1 else None,
+                "n": int(len(x)),
+            }
+
+    return derived
 
 
-# ========================================================================
-# 4. MAIN PIPELINE: build_gender_stats_payload
-# ========================================================================
+# ======================================================================
+# 4) MODELOS MULTIVARIABLES (lineal + logístico si hay outcome)
+# ======================================================================
+
+def compute_multivariable_models(df: pd.DataFrame, sex_gender_info):
+    """
+    Modelos ajustados:
+    - Linear: outcome continuo tipo 'Compliance' ~ Sex + Age + Height + WeightAboveIdeal + Smoking
+    - Logistic: primer outcome binario cuyo nombre contenga 'outcome'
+    """
+    models = {}
+
+    sex_col = sex_gender_info.sex_col or sex_gender_info.gender_col
+    if not sex_col:
+        return models
+
+    # ------------------------------------------------------------------
+    # 4.1. LINEAR – buscar columna de compliance
+    # ------------------------------------------------------------------
+    candidates = [c for c in df.columns if "compliance" in c.lower()]
+    if candidates:
+        outcome_col = candidates[0]
+        cols = [sex_col]
+
+        for label in ["age", "height", "weight above ideal", "weight_above_ideal",
+                      "weightaboveideal", "weight", "smoking", "raucher", "smoker"]:
+            for c in df.columns:
+                if label in c.lower() and c not in cols:
+                    cols.append(c)
+
+        # Quitar duplicados
+        cols = list(dict.fromkeys(cols))
+
+        # Construir dataset limpio
+        used_cols = [outcome_col] + cols
+        sub = df[used_cols].dropna()
+        if len(sub) >= 10:
+            y = sub[outcome_col].astype(float)
+            X = sub[cols].copy()
+
+            # Codificar categóricas simples (e.g. fumador 0/1 se queda igual)
+            for c in X.columns:
+                if not np.issubdtype(X[c].dtype, np.number):
+                    X[c] = X[c].astype("category").cat.codes
+
+            X = sm.add_constant(X)
+
+            try:
+                model = sm.OLS(y, X).fit()
+                n = int(model.nobs)
+                r2_adj = float(model.rsquared_adj)
+
+                sex_term = None
+                for name in model.params.index:
+                    if name == sex_col or name.endswith(f"[T.1]") or name.endswith(f"[T.2]"):
+                        sex_term = name
+                        break
+
+                sex_effect = None
+                if sex_term:
+                    beta = float(model.params[sex_term])
+                    p = float(model.pvalues[sex_term])
+                    sex_effect = f"beta={beta:.3f}, p={p:.3e}"
+
+                models["linear_compliance"] = {
+                    "metric": f"Adj R²={r2_adj:.3f}, n={n}",
+                    "sex_effect": sex_effect,
+                    "notes": f"Outcome={outcome_col}; covariates={cols}",
+                }
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # 4.2. LOGISTIC – outcome binario con 'outcome' en el nombre
+    # ------------------------------------------------------------------
+    bin_candidates = []
+    for c in df.columns:
+        if "outcome" in c.lower():
+            # comprobar si es binaria 0/1
+            vals = df[c].dropna().unique()
+            if len(vals) == 2:
+                bin_candidates.append(c)
+
+    if bin_candidates:
+        outcome_col = bin_candidates[0]
+        cols = [sex_col]
+
+        for label in ["age", "height", "weight", "smoking", "raucher", "smoker"]:
+            for c in df.columns:
+                if label in c.lower() and c not in cols:
+                    cols.append(c)
+        cols = list(dict.fromkeys(cols))
+
+        sub = df[[outcome_col] + cols].dropna()
+        if len(sub) >= 20:
+            y = sub[outcome_col]
+            if not np.issubdtype(y.dtype, np.number):
+                y = y.astype("category").cat.codes
+
+            X = sub[cols].copy()
+            for c in X.columns:
+                if not np.issubdtype(X[c].dtype, np.number):
+                    X[c] = X[c].astype("category").cat.codes
+
+            X = sm.add_constant(X)
+
+            try:
+                model = sm.Logit(y, X).fit(disp=False)
+                n = int(model.nobs)
+
+                sex_term = None
+                for name in model.params.index:
+                    if name == sex_col or name.endswith(f"[T.1]") or name.endswith(f"[T.2]"):
+                        sex_term = name
+                        break
+
+                sex_effect = None
+                if sex_term:
+                    OR = float(np.exp(model.params[sex_term]))
+                    p = float(model.pvalues[sex_term])
+                    sex_effect = f"OR={OR:.3f}, p={p:.3e}"
+
+                models["logistic_outcome"] = {
+                    "metric": f"LogLik={model.llf:.1f}, n={n}",
+                    "sex_effect": sex_effect,
+                    "notes": f"Outcome={outcome_col}; covariates={cols}",
+                }
+            except Exception:
+                pass
+
+    return models
+
+
+# ======================================================================
+# 5) MAIN PIPELINE: build_gender_stats_payload
+# ======================================================================
 
 def build_gender_stats_payload(df: pd.DataFrame) -> dict:
-
-    # Detect sex/gender variables
+    # Detectar columnas de sexo/género
     sex_gender_info = detect_sex_gender_vars(df)
 
-    # Basic dataset info
-    stats = {
+    stats_json = {
         "dataset_info": {
-            "n_total": len(df),
+            "n_total": int(len(df)),
             "count_by_sex": {},
-            "count_by_gender": {}
+            "count_by_gender": {},
         },
         "descriptive": {},
         "group_tests": {},
         "models": {},
         "gender_gap_indicators": {},
+        "derived_indices": {},
         "sex_gender_info": {
             "sex_col": sex_gender_info.sex_col,
-            "gender_col": sex_gender_info.gender_col
-        }
+            "gender_col": sex_gender_info.gender_col,
+        },
     }
 
-    # Counts
+    # Conteos
     if sex_gender_info.sex_col:
-        stats["dataset_info"]["count_by_sex"] = (
+        stats_json["dataset_info"]["count_by_sex"] = (
             df[sex_gender_info.sex_col].value_counts(dropna=True).to_dict()
         )
 
     if sex_gender_info.gender_col:
-        stats["dataset_info"]["count_by_gender"] = (
+        stats_json["dataset_info"]["count_by_gender"] = (
             df[sex_gender_info.gender_col].value_counts(dropna=True).to_dict()
         )
 
-    # Descriptives
-    stats["descriptive"] = compute_descriptives(df, sex_gender_info)
+    # Descriptivos
+    stats_json["descriptive"] = compute_descriptives(df, sex_gender_info)
 
-    # Group tests
-    stats["group_tests"] = compute_group_tests(df, sex_gender_info)
+    # Tests por grupo
+    stats_json["group_tests"] = compute_group_tests(df, sex_gender_info)
 
-    # Models
-    stats["models"] = compute_models(df, sex_gender_info)
+    # Modelos multivariables
+    stats_json["models"] = compute_multivariable_models(df, sex_gender_info)
 
-    # Simple gap indicators (interpretation-level)
+    # Índices derivados (VT indexado, etc.)
+    stats_json["derived_indices"] = compute_derived_indices(df)
+
+    # Indicador simple de cuántas variables tienen p < 0.05
     try:
-        sig = [v for v in stats["group_tests"].values() if v.get("p") < 0.05]
-        stats["gender_gap_indicators"]["significant_differences"] = len(sig)
+        sig = [
+            v for v in stats_json["group_tests"].values()
+            if isinstance(v, dict) and v.get("p") is not None and v["p"] < 0.05
+        ]
+        stats_json["gender_gap_indicators"]["significant_differences"] = len(sig)
     except Exception:
         pass
 
-    return stats
+    return stats_json

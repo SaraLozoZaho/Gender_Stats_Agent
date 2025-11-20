@@ -1,180 +1,195 @@
 # analysis/statistics_pipeline_gender.py
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from scipy import stats
+import statsmodels.api as sm
+
+from .descriptive_gender import compute_descriptive_stats_gender
+from .correlations_gender import compute_correlations_gender
+from .anova_gender import compute_anova_by_sex
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+# ======================================================
+# HELPER: bootstrap CI
+# ======================================================
 
-def _safe_mean(series: pd.Series):
-    s = series.dropna()
-    return float(s.mean()) if len(s) > 0 else None
-
-def _has_variability(arr: np.ndarray):
-    arr = arr[~np.isnan(arr)]
-    return len(np.unique(arr)) >= 2
-
-def _numeric_df(df):
-    return df.select_dtypes(include=[np.number])
-
-
-# =========================================================
-# DESCRIPTIVE STATISTICS
-# =========================================================
-
-def compute_basic_descriptives(df: pd.DataFrame, sex_col: str) -> dict:
-    numeric = _numeric_df(df)
-    overall = numeric.describe().T.round(4).to_dict(orient="index")
-
-    by_sex = {}
-    if sex_col in df.columns:
-        for sex, sub in df.groupby(sex_col):
-            if pd.isna(sex):
-                continue
-            desc = sub[numeric.columns].describe().T.round(4).to_dict(orient="index")
-            by_sex[str(sex)] = desc
-
-    return {
-        "overall": overall,
-        "by_sex": by_sex,
-        "numeric_columns": list(numeric.columns)
-    }
+def bootstrap_ci(x, y, n=2000):
+    """Compute 95% bootstrap CI for mean difference."""
+    x = np.array(x)
+    y = np.array(y)
+    boots = []
+    for _ in range(n):
+        bx = np.random.choice(x, len(x), replace=True)
+        by = np.random.choice(y, len(y), replace=True)
+        boots.append(bx.mean() - by.mean())
+    return float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
 
 
-# =========================================================
-# CORRELATIONS
-# =========================================================
+# ======================================================
+# T-TEST / MANN–WHITNEY / COHEN’S d
+# ======================================================
 
-def compute_correlations(df: pd.DataFrame) -> dict:
-    numeric = _numeric_df(df)
-    corr = numeric.corr().round(3)
-
-    strong = []
-    for i, c1 in enumerate(corr.columns):
-        for c2 in corr.columns[i+1:]:
-            r = corr.loc[c1, c2]
-            if abs(r) >= 0.7:
-                strong.append({"var1": c1, "var2": c2, "r": float(r)})
-
-    return {
-        "matrix": corr.to_dict(),
-        "strong_pairs": strong
-    }
-
-
-# =========================================================
-# ANOVA BETWEEN SEX GROUPS (1 vs 2)
-# =========================================================
-
-def compute_anova_sex(df: pd.DataFrame, sex_col: str) -> dict:
+def compute_group_tests(df, sex_col="Sex"):
     if sex_col not in df.columns:
-        return {"error": f"No '{sex_col}' column found"}
+        return {}
 
-    numeric = _numeric_df(df)
-    result = {}
+    sex_vals = df[sex_col].dropna().unique()
+    if len(sex_vals) != 2:
+        return {}
 
-    groups = df[sex_col].dropna().unique()
-    if len(groups) != 2:
-        return {"error": "Sex analysis requires exactly 2 groups (e.g., 1 = male, 2 = female)."}
+    g1, g2 = sex_vals
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    results = {}
 
-    g1, g2 = groups
-
-    for var in numeric.columns:
+    for var in numeric_cols:
         x = df[df[sex_col] == g1][var].dropna().values
         y = df[df[sex_col] == g2][var].dropna().values
 
-        if len(x) < 2 or len(y) < 2:
+        if len(x) < 3 or len(y) < 3:
             continue
 
-        if not _has_variability(x) or not _has_variability(y):
-            reason = "Constant values, cannot compute ANOVA"
-            result[var] = {"F": None, "p": None, "reason": reason}
-            continue
-
+        # Normality
         try:
-            F, p = stats.f_oneway(x, y)
-            result[var] = {
-                "F": float(F),
+            p1 = stats.shapiro(x)[1]
+            p2 = stats.shapiro(y)[1]
+            normal = p1 > 0.05 and p2 > 0.05
+        except Exception:
+            normal = False
+
+        # Test selection
+        if normal:
+            t, p = stats.ttest_ind(x, y, equal_var=False)
+            test_name = "t-test"
+            effect = float(x.mean() - y.mean())
+            cohen_d = float(effect / np.sqrt((np.std(x, ddof=1)**2 + np.std(y, ddof=1)**2)/2))
+        else:
+            t, p = stats.mannwhitneyu(x, y, alternative="two-sided")
+            test_name = "Mann–Whitney U"
+            effect = float(np.median(x) - np.median(y))
+            cohen_d = None  # not meaningful for nonparametric
+
+        # Bootstrap CI
+        try:
+            ci_low, ci_high = bootstrap_ci(x, y)
+        except Exception:
+            ci_low = ci_high = None
+
+        results[var] = {
+            "test": test_name,
+            "p": float(p),
+            "effect": effect,
+            "cohen_d": cohen_d,
+            "ci": [ci_low, ci_high],
+            "group_sizes": {str(g1): len(x), str(g2): len(y)},
+        }
+
+    return results
+
+
+# ======================================================
+# χ² TEST FOR CATEGORICAL VARIABLES
+# ======================================================
+
+def compute_categorical_tests(df, sex_col="Sex"):
+    if sex_col not in df.columns:
+        return {}
+
+    categorical_cols = [
+        c for c in df.columns
+        if df[c].dtype == "object" or df[c].dtype.name.startswith("category")
+    ]
+
+    results = {}
+
+    for col in categorical_cols:
+        try:
+            table = pd.crosstab(df[sex_col], df[col])
+            if table.shape[1] < 2:
+                continue
+            chisq, p, dof, exp = stats.chi2_contingency(table)
+            results[col] = {
+                "chi2": float(chisq),
                 "p": float(p),
-                "groups": {str(g1): len(x), str(g2): len(y)}
+                "table": table.to_dict(),
             }
-        except Exception as e:
-            result[var] = {"F": None, "p": None, "reason": str(e)}
+        except Exception:
+            continue
 
-    return result
-
-
-# =========================================================
-# SIMPLE REGRESSIONS
-# =========================================================
-
-def compute_simple_regressions(df: pd.DataFrame) -> dict:
-    from scipy.stats import linregress
-
-    result = {}
-    numeric = _numeric_df(df)
-    cols = list(numeric.columns)
-
-    for i, x in enumerate(cols):
-        for y in cols[i+1:]:
-            sub = df[[x, y]].dropna()
-            if len(sub) < 4:
-                continue
-
-            if not _has_variability(sub[x].values) or not _has_variability(sub[y].values):
-                continue
-
-            try:
-                r = linregress(sub[x], sub[y])
-                result[f"{y}_vs_{x}"] = {
-                    "x": x,
-                    "y": y,
-                    "coef": float(r.slope),
-                    "intercept": float(r.intercept),
-                    "r2": float(r.rvalue**2),
-                    "p": float(r.pvalue),
-                    "stderr": float(r.stderr),
-                    "n": len(sub),
-                }
-            except Exception:
-                continue
-
-    return result
+    return results
 
 
-# =========================================================
-# FINAL PAYLOAD (like build_stats_payload)
-# =========================================================
+# ======================================================
+# Logistic regression
+# ======================================================
 
-def build_gender_stats_payload(df: pd.DataFrame, sex_col: str = "Sex") -> dict:
+def compute_logistic_regression(df, sex_col="Sex"):
+    """
+    Tries to find a binary outcome automatically.
+    """
+    binary_cols = [c for c in df.columns if df[c].dropna().isin([0,1]).all()]
 
-    numeric = _numeric_df(df)
+    if not binary_cols:
+        return {}
 
-    payload = {
-        "dataset_info": {
-            "n_rows": int(df.shape[0]),
-            "n_cols": int(df.shape[1]),
-            "columns": list(df.columns),
-            "count_by_sex": df[sex_col].value_counts(dropna=True).to_dict()
-                if sex_col in df.columns else {},
-        },
+    ycol = binary_cols[0]
 
-        "descriptive": compute_basic_descriptives(df, sex_col),
-        "correlations": compute_correlations(df),
-        "anova_sex": compute_anova_sex(df, sex_col),
-        "regressions": compute_simple_regressions(df),
-    }
+    if sex_col not in df.columns:
+        return {}
 
-    # Simple gender-gap indicator
+    df2 = df[[ycol, sex_col]].dropna()
+
+    # encode
+    df2["sex_encoded"] = df2[sex_col].astype("category").cat.codes
+
+    X = sm.add_constant(df2["sex_encoded"])
+    y = df2[ycol]
+
     try:
-        sig = [v for v in payload["anova_sex"].values() if isinstance(v, dict) and v.get("p") and v["p"] < 0.05]
-        payload["gender_gap_indicators"] = {
-            "significant_variables": len(sig)
+        model = sm.Logit(y, X).fit(disp=False)
+        OR = float(np.exp(model.params["sex_encoded"]))
+        p = float(model.pvalues["sex_encoded"])
+        return {
+            "outcome": ycol,
+            "OR": OR,
+            "p": p,
+            "n": len(df2),
         }
     except Exception:
-        payload["gender_gap_indicators"] = {}
+        return {}
+
+
+# ======================================================
+# MAIN PIPELINE
+# ======================================================
+
+def build_gender_stats_payload(df: pd.DataFrame, sex_col="Sex"):
+    payload = {}
+
+    # Dataset info
+    payload["dataset_info"] = {
+        "n_rows": len(df),
+        "n_cols": len(df.columns),
+        "columns": list(df.columns),
+        "count_by_sex": df[sex_col].value_counts(dropna=True).to_dict()
+            if sex_col in df.columns else {}
+    }
+
+    # Blocks
+    payload["descriptive"] = compute_descriptive_stats_gender(df, sex_col)
+    payload["correlations"] = compute_correlations_gender(df)
+    payload["anova_sex"] = compute_anova_by_sex(df, sex_col)
+    payload["t_tests"] = compute_group_tests(df, sex_col)
+    payload["categorical_tests"] = compute_categorical_tests(df, sex_col)
+    payload["logistic_regression"] = compute_logistic_regression(df, sex_col)
+
+    # Summary indicator
+    payload["gender_gap_indicators"] = {
+        "significant_t_tests": len([v for v in payload["t_tests"].values() if v["p"] < 0.05]),
+        "significant_anova": len([
+            v for v in payload["anova_sex"].values()
+            if isinstance(v, dict) and v.get("p") is not None and v["p"] < 0.05
+        ])
+    }
 
     return payload
