@@ -1,6 +1,8 @@
 # GENDER_STATS_AGENT/gui/interface.py
 
 import tkinter as tk
+import traceback
+import sys
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 import pandas as pd
@@ -10,71 +12,160 @@ from analysis.statistics_pipeline_gender import build_gender_stats_payload
 
 
 # ============================================================
-# Format stats nicely for display
+# PRINT FULL TRACEBACK TO CONSOLE
+# ============================================================
+
+def print_exception_to_console(e):
+    print("\n" + "="*80)
+    print("GUI ERROR:")
+    traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
+    print("="*80 + "\n")
+
+
+# ============================================================
+# FORMAT STATS (IMPROVED)
 # ============================================================
 
 def format_stats_for_display(stats_json: dict) -> str:
     lines = []
 
+    # DATASET INFO
     info = stats_json.get("dataset_info", {})
-    lines.append("=== DATASET INFORMATION ===")
-    lines.append(f"Rows: {info.get('n_rows')}")
-    lines.append(f"Columns: {info.get('n_cols')}")
+    lines.append("========================================")
+    lines.append("           DATASET INFORMATION")
+    lines.append("========================================")
+    lines.append(f"Rows:     {info.get('n_rows')}")
+    lines.append(f"Columns:  {info.get('n_cols')}")
     lines.append("")
 
     # SEX COUNTS
     lines.append("=== SEX DISTRIBUTION (1=Male, 2=Female) ===")
-    sex_counts = info.get("count_by_sex", {})
-    for s, n in sex_counts.items():
-        lines.append(f"  Sex {s}: n={n}")
+    for sex, n in info.get("count_by_sex", {}).items():
+        lines.append(f"  Sex {sex}: n={n}")
     lines.append("")
 
     # DESCRIPTIVES
+    lines.append("========================================")
+    lines.append("          DESCRIPTIVE STATISTICS")
+    lines.append("========================================")
     desc = stats_json.get("descriptive", {})
-    lines.append("=== DESCRIPTIVE STATISTICS ===")
-
-    if "by_sex" in desc:
-        for sex, vars_ in desc["by_sex"].items():
-            lines.append(f"\nSex = {sex}:")
-            for var, st in vars_.items():
-                mean = st.get("mean")
-                if mean is not None:
-                    lines.append(f"  {var}: mean = {mean:.3f}")
+    for sex, vars_ in desc.get("by_sex", {}).items():
+        lines.append(f"\nSex = {sex}:")
+        for var, st in vars_.items():
+            mean = st.get("mean")
+            sd = st.get("sd")
+            if mean is not None:
+                lines.append(f"  {var}: mean={mean:.3f}, sd={sd}")
     lines.append("")
 
     # CORRELATIONS
-    corr = stats_json.get("correlations", {})
-    lines.append("=== STRONG CORRELATIONS (|r| ≥ 0.7) ===")
-    strong = corr.get("strong_pairs", [])
+    lines.append("========================================")
+    lines.append("          STRONG CORRELATIONS")
+    lines.append("========================================")
+    strong = stats_json.get("correlations", {}).get("strong_pairs", [])
     if strong:
-        for pair in strong:
-            lines.append(f"  {pair['var1']} ↔ {pair['var2']} (r = {pair['r']})")
+        for p in strong:
+            lines.append(f"  {p['var1']} ↔ {p['var2']} (r={p['r']:.3f})")
     else:
         lines.append("  None found.")
     lines.append("")
 
     # ANOVA
+    lines.append("========================================")
+    lines.append("               ANOVA BY SEX")
+    lines.append("========================================")
+
     anova = stats_json.get("anova_sex", {})
-    lines.append("=== ANOVA BY SEX ===")
+
     for var, res in anova.items():
-        if isinstance(res, dict) and res.get("p") is not None:
-            lines.append(f"  {var}: F={res.get('F')}, p={res.get('p')}")
+        if not isinstance(res, dict):
+            continue
+
+        F = res.get("F")
+        p = res.get("p")
+        gs = res.get("group_sizes", {})
+
+        n1 = gs.get("1")
+        n2 = gs.get("2")
+
+        if F is None or p is None:
+            reason = res.get("reason", "ANOVA could not be computed.")
+            lines.append(f"{var}: {reason} (n1={n1}, n2={n2})")
+        else:
+            lines.append(f"{var}: F={F:.3f}, p={p:.3e} (n1={n1}, n2={n2})")
+
+
     lines.append("")
 
-    # REGRESSIONS
-    regs = stats_json.get("regressions", {})
-    lines.append("=== REGRESSIONS ===")
-    for name, reg in regs.items():
-        if "coef" in reg:
-            lines.append(
-                f"  {name}: coef={reg['coef']:.3f}, R²={reg['r2']:.3f}, p={reg['p']:.3e}"
-            )
+    # T-TESTS / U-TESTS
+    lines.append("========================================")
+    lines.append("       GROUP TESTS (t-test / U-test)")
+    lines.append("========================================")
+    for var, res in stats_json.get("t_tests", {}).items():
+        lines.append(f"\n{var}:")
+        lines.append(f"  Test:       {res['test']}")
+        lines.append(f"  Effect:     {res['effect']:.3f}")
+        lines.append(f"  p-value:    {res['p']:.3e}")
+        if res["cohen_d"] is not None:
+            lines.append(f"  Cohen's d:  {res['cohen_d']:.3f}")
+        ci = res["ci"]
+        if ci:
+            lines.append(f"  95% CI:     [{ci[0]:.3f}, {ci[1]:.3f}]")
+        gs = res["group_sizes"]
+        # Convert keys to sorted order for consistent printing
+        keys = sorted(gs.keys(), key=lambda x: str(x))
+
+        for k in keys:
+            lines.append(f"  n (sex={k}) = {gs[k]}")
+
+    lines.append("")
+
+    # CHI-SQUARE
+    lines.append("========================================")
+    lines.append("      CHI-SQUARE TESTS (categorical)")
+    lines.append("========================================")
+    chi = stats_json.get("categorical_tests", {})
+    if chi:
+        for col, res in chi.items():
+            lines.append(f"\n{col}:")
+            lines.append(f"  χ² = {res['chi2']:.3f}")
+            lines.append(f"  p  = {res['p']:.3e}")
+    else:
+        lines.append("  No categorical tests available.")
+    lines.append("")
+
+    # LOGISTIC REGRESSION
+    lines.append("========================================")
+    lines.append("       LOGISTIC REGRESSION")
+    lines.append("========================================")
+    logreg = stats_json.get("logistic_regression", {})
+    if logreg:
+        if "error" in logreg:
+            lines.append("  ERROR in logistic regression:")
+            lines.append(f"  {logreg['error']}")
+        else:
+            lines.append(f"Outcome:      {logreg['outcome']}")
+            lines.append(f"Odds Ratio:   {logreg['OR']:.3f}")
+            lines.append(f"p-value:      {logreg['p']:.3e}")
+            lines.append(f"n:            {logreg['n']}")
+    else:
+        lines.append("  No binary outcome detected.")
+    lines.append("")
+
+    # SUMMARY
+    lines.append("========================================")
+    lines.append("                SUMMARY")
+    lines.append("========================================")
+    summary = stats_json.get("gender_gap_indicators", {})
+    lines.append(f"Significant t-tests:     {summary.get('significant_t_tests', 0)}")
+    lines.append(f"Significant ANOVA:       {summary.get('significant_anova', 0)}")
+    lines.append(f"Significant categorical: {summary.get('significant_categorical', 0)}")
 
     return "\n".join(lines)
 
 
 # ============================================================
-# GUI APPLICATION
+# GUI
 # ============================================================
 
 def launch_gui():
@@ -92,13 +183,21 @@ def launch_gui():
     style_combo = ttk.Combobox(
         top_frame,
         textvariable=report_style_var,
-        values=["investigator", "clinical", "short_clinical", "reviewer", "grant"],
+        values=[
+            "investigator",
+            "investigator_advanced",
+            "clinical",
+            "clinical_advanced",
+            "short_clinical",
+            "reviewer",
+            "grant",
+        ],
         state="readonly",
         width=25,
     )
     style_combo.pack(side="left", padx=10)
 
-    # QUESTION BOX
+    # QUESTION
     tk.Label(top_frame, text="Ask the expert:").pack(side="left", padx=(20, 5))
     question_box = tk.Text(top_frame, height=3, width=55)
     question_box.pack(side="left", padx=10)
@@ -107,9 +206,7 @@ def launch_gui():
     stats_state = {"stats": None}
     conversation_state = {"history": []}
 
-    # --------------------------------------------
     # LOAD DATA
-    # --------------------------------------------
     def load_and_analyze():
         path = filedialog.askopenfilename(
             initialdir=r"Y:\BWSync\Agents\Gender_Stats_Agent\data",
@@ -120,17 +217,39 @@ def launch_gui():
 
         try:
             df = pd.read_csv(path) if path.endswith(".csv") else pd.read_excel(path)
+
+            # Limpieza global para evitar errores silenciosos
+            df.columns = (
+                df.columns
+                .astype(str)
+                .str.replace("\ufeff", "", regex=False)   # elimina BOM
+                .str.replace("\xa0", " ", regex=False)    # elimina espacio NO separable
+                .str.strip()                              # quita espacios normales
+            )
+
+            # eliminar duplicadas después de limpiar completamente
+            df = df.loc[:, ~df.columns.duplicated()]
+
+
+            print("\n=== COLUMNAS DEL DATAFRAME ===")
+            print(df.columns.tolist())
+            print("===============================\n")
+
+            stats_json = build_gender_stats_payload(df, sex_col="Sex")
+
         except Exception as e:
+            print_exception_to_console(e)
             messagebox.showerror("Error loading file", f"{e}")
             return
 
         if "Sex" not in df.columns:
-            messagebox.showwarning("Missing 'Sex' column", "Dataset must have a column named 'Sex'.")
+            messagebox.showwarning("Missing 'Sex' column", "Dataset must have a column 'Sex'.")
             return
 
         try:
             stats_json = build_gender_stats_payload(df, sex_col="Sex")
         except Exception as e:
+            print_exception_to_console(e)
             messagebox.showerror("Analysis error", f"{e}")
             return
 
@@ -144,9 +263,7 @@ def launch_gui():
 
         messagebox.showinfo("Done", "Statistical analysis completed.")
 
-    # --------------------------------------------
-    # ASK EXPERT AGENT
-    # --------------------------------------------
+    # RUN AGENT
     def run_agent_call():
         stats_json = stats_state.get("stats")
         if stats_json is None:
@@ -164,6 +281,7 @@ def launch_gui():
                 history=conversation_state["history"],
             )
         except Exception as e:
+            print_exception_to_console(e)
             messagebox.showerror("Agent error", f"{e}")
             return
 
@@ -185,9 +303,10 @@ def launch_gui():
         interp_text_box.delete("1.0", tk.END)
         interp_text_box.config(state="disabled")
         question_box.delete("1.0", tk.END)
+
         messagebox.showinfo("Reset", "Conversation cleared.")
 
-    # SAVE REPORT
+    # SAVE
     def save_report():
         content = interp_text_box.get("1.0", tk.END).strip()
         if not content:

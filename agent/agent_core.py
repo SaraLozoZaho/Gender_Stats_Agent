@@ -168,6 +168,16 @@ def run_gender_expert_agent(
             "Write as a senior researcher and biostatistician. Discuss mechanisms, confounding, "
             "effect modification, limitations, and implications for future research."
         ),
+        "investigator_advanced": (
+            "Write as a senior investigator in perioperative medicine and gender medicine. "
+            "Integrate all available statistical tests (ANOVA, t-tests, Mann–Whitney, chi-square, logistic regression). "
+            "Interpret effect sizes, confidence intervals, magnitude and direction of differences. "
+            "Assess confounding (age, comorbidity, anthropometry), effect modification, collinearity, and missing data. "
+            "Identify clinically meaningful differences even if not statistically significant. "
+            "Explain whether findings suggest biological sex differences, sociocultural gender differences, or spurious associations. "
+            "Propose additional statistical models (multivariable regression, adjusted models, stratification, interaction terms). "
+            "Keep reasoning strictly tied to the provided dataset summary—never invent values."
+        ),
         "reviewer": (
             "Write as a peer reviewer for a high-impact journal. Critically assess methods, "
             "risk of bias, adequacy of sex/gender analysis, and reporting quality."
